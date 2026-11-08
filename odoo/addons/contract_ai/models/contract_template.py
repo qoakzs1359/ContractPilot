@@ -1,0 +1,165 @@
+# ════════════════════════════════════════════════
+# contract.template  — 合同模板
+# contract.clause    — 合同条款（既可属于模板也可属于具体合同）
+# ════════════════════════════════════════════════
+from markupsafe import escape
+
+from odoo import models, fields, api, _
+
+from .clause_rendering import render_clause_text_to_html, render_clause_preview
+
+
+class ContractTemplate(models.Model):
+    """合同模板"""
+    _name = "contract.template"
+    _description = "合同模板"
+    _order = "name"
+
+    # ── 基本信息 ──
+    # 注：本模型未继承 mail.thread（无 chatter），不支持 tracking，勿加 tracking=True
+    name = fields.Char(string="模板名称", required=True)
+    type = fields.Selection(
+        [
+            ("purchase", "采购合同"),
+            ("sale", "销售合同"),
+            ("service", "服务合同"),
+            ("lease", "租赁合同"),
+            ("labor", "劳动合同"),
+            ("consulting", "咨询合同"),
+            ("other", "其他"),
+        ],
+        string="适用合同类型", required=True,
+    )
+    description = fields.Text(string="模板说明")
+
+    # ── 版本管理 ──
+    version = fields.Char(string="版本号", default="v1.0")
+    is_active = fields.Boolean(string="启用", default=True)
+
+    # ── 使用统计 ──
+    usage_count = fields.Integer(string="使用次数", default=0)
+
+    # ── 条款（One2many → contract.clause, template_id） ──
+    clause_ids = fields.One2many(
+        "contract.clause", "template_id", string="模板条款",
+    )
+    clause_count = fields.Integer(
+        string="条款数", compute="_compute_clause_count",
+    )
+    # ── 模板条款全文排版预览（M23：纯文本 → 结构化 HTML，展示层渲染） ──
+    clauses_preview_html = fields.Html(
+        string="条款排版预览", compute="_compute_clauses_preview_html",
+        readonly=True, sanitize=False, copy=False,
+    )
+
+    @api.depends("clause_ids")
+    def _compute_clause_count(self):
+        for rec in self:
+            rec.clause_count = len(rec.clause_ids)
+
+    @api.depends("clause_ids.sort_order", "clause_ids.name", "clause_ids.content")
+    def _compute_clauses_preview_html(self):
+        for rec in self:
+            clauses = rec.clause_ids.sorted(key=lambda c: (c.sort_order, c.id))
+            parts = []
+            for idx, clause in enumerate(clauses, start=1):
+                title = "%d. %s" % (idx, clause.name or "条款 %d" % idx)
+                parts.append(
+                    '<section class="clause-section">'
+                    '<h3 class="clause-title">%s</h3>%s</section>'
+                    % (escape(title), clause.content_html or "")
+                )
+            if not parts:
+                rec.clauses_preview_html = '<p class="clause-p">暂无模板条款</p>'
+            else:
+                rec.clauses_preview_html = "".join(parts)
+
+
+class ContractClause(models.Model):
+    """合同条款
+    - 可以属于一个模板（template_id）
+    - 也可以属于一份具体合同（contract_id）
+    - 从模板应用到合同时：template_id 保留来源，contract_id 指向目标合同
+    """
+    _name = "contract.clause"
+    _description = "合同条款"
+    _order = "contract_id, template_id, sort_order"
+
+    # ════════════════════════════════════════════════
+    # 关联
+    # ════════════════════════════════════════════════
+    # 属于哪份合同（子表 inverse）
+    contract_id = fields.Many2one(
+        "contract.contract", string="所属合同",
+        ondelete="cascade", index=True,
+    )
+    # 来源于哪个模板
+    template_id = fields.Many2one(
+        "contract.template", string="来源模板",
+        ondelete="cascade", index=True,
+    )
+
+    # ════════════════════════════════════════════════
+    # 条款内容
+    # ════════════════════════════════════════════════
+    name = fields.Char(string="条款标题", required=True)
+    clause_type = fields.Selection(
+        [
+            ("main", "主条款"),
+            ("payment", "付款条款"),
+            ("liability", "违约责任"),
+            ("dispute", "争议解决"),
+            ("confidential", "保密条款"),
+            ("termination", "终止条款"),
+            ("warranty", "质保条款"),
+            ("intellectual_property", "知识产权"),
+            ("force_majeure", "不可抗力"),
+            ("other", "其他"),
+        ],
+        string="条款类型", default="other",
+    )
+    content = fields.Text(string="条款正文", required=True)
+    # ── 排版展示层字段（M23，只读渲染，不改动 content 纯文本存储） ──
+    # 结构化排版预览：编号标题识别（第X条/一、/（一）/1.）→ 加粗层级 + 段落缩进
+    content_html = fields.Html(
+        string="条款正文（排版预览）", compute="_compute_content_html",
+        readonly=True, sanitize=False, copy=False,
+    )
+    # 列表视图单行摘要：取正文首行截断，避免长文在 tree 单元格平铺
+    content_preview = fields.Char(
+        string="正文摘要", compute="_compute_content_preview",
+        readonly=True, copy=False,
+    )
+    sort_order = fields.Integer(string="排序", default=10)
+
+    # ── 条款属性 ──
+    source = fields.Selection(
+        [
+            ("manual", "人工录入"),
+            ("ai_extracted", "AI 提取"),
+            ("template", "模板"),
+        ],
+        string="来源", default="manual", index=True, copy=False,
+        help="记录条款来源：AI 自动提取的条款在重新识别时会被覆盖，人工/模板条款不受影响",
+    )
+    is_required = fields.Boolean(
+        string="必备条款", default=False,
+        help="模板中标记为必备的条款在应用到合同时不可删除",
+    )
+    is_modified = fields.Boolean(
+        string="已修改", default=False, copy=False,
+        help="从模板复制到合同后是否被编辑过",
+    )
+
+    # ════════════════════════════════════════════════
+    # 排版渲染（M23）
+    # ════════════════════════════════════════════════
+    @api.depends("content")
+    def _compute_content_html(self):
+        for rec in self:
+            rec.content_html = render_clause_text_to_html(rec.content)
+
+    @api.depends("content")
+    def _compute_content_preview(self):
+        for rec in self:
+            rec.content_preview = render_clause_preview(rec.content)

@@ -1,0 +1,1420 @@
+# ════════════════════════════════════════════════
+# contract.contract — 合同核心台账模型
+# ════════════════════════════════════════════════
+import base64
+import json
+import logging
+import re
+import requests
+import threading
+from datetime import date, timedelta
+
+from odoo import models, fields, api, _
+from odoo.exceptions import UserError, ValidationError
+from psycopg2.errors import SerializationFailure
+from markupsafe import escape
+
+_logger = logging.getLogger(__name__)
+
+
+class Contract(models.Model):
+    """合同主台账"""
+    _name = "contract.contract"
+    _description = "合同台账"
+    _inherit = ["mail.thread", "mail.activity.mixin"]
+    _order = "create_date desc"
+
+    # ── SQL 约束：数据库层保证数据完整性 ──
+    _sql_constraints = [
+        # 合同编号唯一（允许为空，但一旦填写不能重复）
+        ("code_uniq", "unique(code)", "合同编号不能重复"),
+    ]
+
+    # M22: AI 复核待办的固定摘要（用于识别/清理本模块创建的 activity）
+    _AI_REVIEW_ACTIVITY_SUMMARY = "AI 质量门禁待复核"
+
+    # ════════════════════════════════════════════════
+    # 基本信息
+    # ════════════════════════════════════════════════
+    name = fields.Char(
+        string="合同名称", tracking=True,
+        help="合同的完整名称，如「设备采购合同」。"
+             "上传 PDF 后由 AI 自动回填，识别期间不强制填写（视图层条件必填）",
+    )
+    code = fields.Char(
+        string="合同编号", tracking=True, copy=False, index=True,
+        help="合同唯一编号，如 CG-2025-001",
+    )
+    type = fields.Selection(
+        [
+            ("purchase", "采购合同"),
+            ("sale", "销售合同"),
+            ("service", "服务合同"),
+            ("lease", "租赁合同"),
+            ("labor", "劳动合同"),
+            ("partnership", "合作协议"),
+            ("consulting", "咨询合同"),
+            ("other", "其他"),
+        ],
+        string="合同类型", tracking=True,
+    )
+
+    # ════════════════════════════════════════════════
+    # 合同相对方（Many2one → contract.counterparty）
+    # ════════════════════════════════════════════════
+    partner_a = fields.Many2one(
+        "contract.counterparty", string="甲方",
+        ondelete="restrict", tracking=True,
+        help="合同的甲方相对方",
+    )
+    partner_b = fields.Many2one(
+        "contract.counterparty", string="乙方",
+        ondelete="restrict", tracking=True,
+        help="合同的乙方相对方",
+    )
+    signatory_id = fields.Many2one(
+        "contract.signatory", string="签约方",
+        ondelete="set null", tracking=True,
+        help="我方签约人",
+    )
+
+    # ════════════════════════════════════════════════
+    # 金额
+    # ════════════════════════════════════════════════
+    currency_id = fields.Many2one(
+        "res.currency", string="币种",
+        default=lambda self: self.env.company.currency_id,
+    )
+    amount = fields.Monetary(
+        string="合同金额", currency_field="currency_id", tracking=True,
+    )
+    amount_uppercase = fields.Char(string="金额大写")
+
+    # ════════════════════════════════════════════════
+    # 日期
+    # ════════════════════════════════════════════════
+    date_signed = fields.Date(string="签订日期", tracking=True, index=True)
+    date_start = fields.Date(string="生效日期")
+    date_end = fields.Date(string="失效日期", index=True)
+
+    # ════════════════════════════════════════════════
+    # 业务条款
+    # ════════════════════════════════════════════════
+    payment_terms = fields.Text(string="付款方式")
+    breach_clause = fields.Text(string="违约责任")
+    dispute_resolution = fields.Selection(
+        [
+            ("litigation", "诉讼（法院管辖）"),
+            ("arbitration", "仲裁（仲裁委员会）"),
+            ("negotiation", "协商解决"),
+        ],
+        string="争议解决方式",
+    )
+
+    # ════════════════════════════════════════════════
+    # 文件与 AI 数据
+    # ════════════════════════════════════════════════
+    source_pdf = fields.Binary(string="源文件 PDF")
+    source_pdf_filename = fields.Char(string="文件名")
+    ai_extracted_json = fields.Json(
+        string="AI 提取原始 JSON",
+        help="AI 服务返回的完整提取结果（调试/审计用）",
+    )
+
+    # ════════════════════════════════════════════════
+    # 关联：付款计划 / 条款 / 元素
+    # ════════════════════════════════════════════════
+    payment_plan_ids = fields.One2many(
+        "contract.payment.plan", "contract_id", string="收付款计划",
+    )
+    # ── M16 汇总计算字段 ──
+    payment_plan_count = fields.Integer(
+        string="计划数量", compute="_compute_payment_summary", store=True,
+    )
+    planned_amount_total = fields.Monetary(
+        string="计划总额", currency_field="currency_id",
+        compute="_compute_payment_summary", store=True,
+        help="所有收付款计划的计划金额合计",
+    )
+    paid_amount_total = fields.Monetary(
+        string="已完成金额", currency_field="currency_id",
+        compute="_compute_payment_summary", store=True,
+        help="状态为已完成的计划的实际金额合计",
+    )
+    remaining_amount_total = fields.Monetary(
+        string="剩余待执行", currency_field="currency_id",
+        compute="_compute_payment_summary", store=True,
+        help="计划总额 − 已完成金额",
+    )
+    overdue_count = fields.Integer(
+        string="逾期数", compute="_compute_payment_summary", store=True,
+    )
+    clause_ids = fields.One2many(
+        "contract.clause", "contract_id", string="合同条款",
+    )
+    # ── 合同条款全文排版预览（M23：按 sort_order 拼接全部条款，展示层渲染） ──
+    clauses_preview_html = fields.Html(
+        string="条款排版预览", compute="_compute_clauses_preview_html",
+        readonly=True, sanitize=False, copy=False,
+    )
+    element_ids = fields.One2many(
+        "contract.element", "contract_id", string="合同元素",
+    )
+    approval_log_ids = fields.One2many(
+        "contract.approval.log", "contract_id", string="审批记录",
+    )
+
+    # ════════════════════════════════════════════════
+    # 辅助字段
+    # ════════════════════════════════════════════════
+    classify_confidence = fields.Float(string="分类置信度", digits=(3, 2))
+    extraction_confidence = fields.Float(string="提取置信度", digits=(3, 2))
+    # ── 是否 AI 生成（computed：ai_extracted_json 有值即为 True）──
+    is_ai_generated = fields.Boolean(
+        string="AI 提取", compute="_compute_is_ai_generated",
+        store=True, copy=False, index=True,
+        help="字段是否由 AI 智能提取生成（基于 ai_extracted_json 是否为空）",
+    )
+    # ── AI 识别状态（异步提取过程跟踪）──
+    ai_extract_status = fields.Selection(
+        [
+            ("draft", "未识别"),
+            ("running", "识别中"),
+            ("success", "识别成功"),
+            ("failed", "识别失败"),
+        ],
+        string="AI 识别状态", default="draft", copy=False, index=True,
+        help="后台异步识别的状态跟踪：未识别 → 识别中 → 成功/失败。"
+             "手动新建（未走 AI 流程）的记录保持「未识别」",
+    )
+    ai_extract_error = fields.Text(string="AI 识别错误信息", copy=False)
+
+    # ── AI 质量门禁（AI 服务 quality 块 → 分级落库）──
+    review_state = fields.Selection(
+        [
+            ("none", "无需复核"),
+            ("pending", "待人工复核"),
+            ("confirmed", "已人工确认"),
+        ],
+        string="复核状态", default="none", copy=False, index=True,
+        help="AI 质量门禁结果：置信度低/字段证据不符/关键字段缺失等风险"
+             "会进入「待人工复核」，复核确认后才能提交审批",
+    )
+    review_reasons = fields.Text(
+        string="复核原因", copy=False, readonly=True,
+        help="AI 质量门禁标记的风险明细（每行一条）",
+    )
+    system_confidence = fields.Float(
+        string="系统置信度", digits=(3, 2), copy=False,
+        help="AI 校验器综合置信度（证据核验/交叉校验/完整性），"
+             "低于阈值会被强制转入人工复核",
+    )
+
+    @api.depends("ai_extracted_json")
+    def _compute_is_ai_generated(self):
+        for rec in self:
+            rec.is_ai_generated = bool(rec.ai_extracted_json)
+
+    @api.depends("clause_ids.sort_order", "clause_ids.name", "clause_ids.content")
+    def _compute_clauses_preview_html(self):
+        """M23：合同条款全文排版预览（每条 = 编号标题 + 结构化正文渲染）。"""
+        for rec in self:
+            clauses = rec.clause_ids.sorted(key=lambda c: (c.sort_order, c.id))
+            parts = []
+            for idx, clause in enumerate(clauses, start=1):
+                title = "%d. %s" % (idx, clause.name or "条款 %d" % idx)
+                parts.append(
+                    '<section class="clause-section">'
+                    '<h3 class="clause-title">%s</h3>%s</section>'
+                    % (escape(title), clause.content_html or "")
+                )
+            if not parts:
+                rec.clauses_preview_html = '<p class="clause-p">暂无合同条款</p>'
+            else:
+                rec.clauses_preview_html = "".join(parts)
+
+    # ════════════════════════════════════════════════
+    # 状态机
+    # ════════════════════════════════════════════════
+    state = fields.Selection(
+        [
+            ("draft", "草拟"),
+            ("approval", "审批中"),
+            ("seal", "已用印"),
+            ("archived", "已归档"),
+            ("void", "已作废"),
+        ],
+        string="状态", default="draft", tracking=True, copy=False, index=True,
+        group_expand="_expand_states",
+    )
+
+    # ── 状态组展开（Kanban 按 state 分组时显示空列） ──
+    @api.model
+    def _expand_states(self, records, domain, context):
+        return ["draft", "approval", "seal", "archived", "void"]
+
+    # ════════════════════════════════════════════════
+    # 自动生成合同编号（M17：优先用 config 模型）
+    # ════════════════════════════════════════════════
+    @api.model_create_multi
+    def create(self, vals_list):
+        for vals in vals_list:
+            if not vals.get("code"):
+                code = self._generate_code_via_config()
+                if not code or code == "/":
+                    # 兜底：Odoo 原生 ir.sequence
+                    code = self.env["ir.sequence"].next_by_code("contract_ai.code") or "/"
+                vals["code"] = code
+        return super().create(vals_list)
+
+    @api.model
+    def _generate_code_via_config(self) -> str:
+        """通过 contract.config 单例生成编号（M17 新机制）"""
+        try:
+            Config = self.env["contract.config"]
+            config = Config._get_config()
+            return config.generate_contract_code()
+        except Exception:
+            _logger.warning("config 编号生成失败，降级到原生 ir.sequence", exc_info=True)
+            return ""
+
+    # ════════════════════════════════════════════════
+    # M17 · Excel 导出（跳转 HTTP 控制器）
+    # ════════════════════════════════════════════════
+    def action_export_excel(self):
+        """导出当前合同列表为 Excel"""
+        base_url = self.env["ir.config_parameter"].sudo().get_param("web.base.url")
+        return {
+            "type": "ir.actions.act_url",
+            "url": f"{base_url}/contract/export/excel",
+            "target": "self",
+        }
+
+    # ════════════════════════════════════════════════
+    # 校验
+    # ════════════════════════════════════════════════
+    @api.constrains("date_start", "date_end")
+    def _check_date_range(self):
+        for rec in self:
+            if rec.date_start and rec.date_end and rec.date_start > rec.date_end:
+                raise ValidationError(_("生效日期不能晚于失效日期"))
+
+    # ════════════════════════════════════════════════
+    # AI 服务调用：一键提取（异步，不阻塞浏览器）
+    # ════════════════════════════════════════════════
+    # 扫描版 PDF 走 OCR + LLM 全流程约 60~120 秒，同步等待必然撞
+    # requests 超时 / Odoo worker limit_time_real（默认 120s）。
+    # 因此统一改为后台线程执行：立即返回，完成后 chatter 通知 + 字段回填。
+
+    # 后台线程内 requests 超时（秒）：扫描版 OCR 90s+，留足余量
+    AI_EXTRACT_TIMEOUT = 300
+
+    def action_ai_extract(self):
+        """后台调用 AI 服务：PDF → 分类 + 字段提取（立即返回）"""
+        self.ensure_one()
+        if not self.source_pdf:
+            raise UserError(_(
+                "请先上传合同 PDF 文件：请在「📎 合同文件」页签选择文件后，"
+                "先点击 💾 保存记录，再点击「AI 自动提取」。\n\n"
+                "提示：也可使用顶部菜单「上传 PDF - AI 识别」一步完成上传与识别。"
+            ))
+        # ── 重提取保护：已人工确认的数据不允许被 AI 静默覆盖 ──
+        if self.review_state == "confirmed":
+            raise UserError(_(
+                "该合同的 AI 提取结果已人工确认，重新识别会覆盖已确认的数据。\n\n"
+                "如确需重新识别，请先点击「♻️ 重置复核」按钮。"
+            ))
+        if self.ai_extract_status == "running":
+            # 防僵尸：正常识别最长 ~5 分钟（AI_EXTRACT_TIMEOUT=300s），
+            # running 超 15 分钟视为后台线程已死（旧版本 bug 遗留），
+            # 自动放行重新提交，否则用户永远只能看到「识别中」无法重试
+            running_since = self.write_date
+            if running_since and (fields.Datetime.now() - running_since).total_seconds() < 900:
+                return self._notify("识别中", "AI 识别正在进行，请稍后刷新页面查看结果", "info")
+            self.message_post(
+                body=_("⚠️ 识别状态卡在「识别中」超过 15 分钟（疑似后台线程异常退出），自动重新提交识别…"),
+                subtype_id=self.env.ref("mail.mt_comment").id,
+            )
+
+        self._spawn_ai_extraction()
+        # ⚠️ 必须返回单个 action dict：Odoo 17 前端 doAction 不接受 action 数组，
+        #    返回 list 会导致页面不跳转/空白（识别提交通知已在 chatter 中）
+        return {
+            "type": "ir.actions.act_window",
+            "res_model": "contract.contract",
+            "res_id": self.id,
+            "view_mode": "form",
+            "target": "current",
+        }
+
+    def _spawn_ai_extraction(self):
+        """在独立后台线程中执行 AI 提取（新 cursor，不阻塞当前 HTTP 请求）"""
+        dbname = self.env.cr.dbname
+        contract_id = self.id
+        self.sudo().write({"ai_extract_status": "running", "ai_extract_error": False})
+        self.message_post(
+            body=_("🤖 已提交后台 AI 识别（分类 → 字段提取 → 收付款计划），完成后自动回填…"),
+            subtype_id=self.env.ref("mail.mt_comment").id,
+        )
+        # 关键：必须先提交事务，否则后台线程的 exists() 看不到本行而静默跳过
+        self.env.cr.commit()
+        threading.Thread(
+            target=type(self)._bg_ai_extract_entry,
+            args=(dbname, contract_id),
+            daemon=True,
+            name=f"ai-extract-{contract_id}",
+        ).start()
+
+    @staticmethod
+    def _bg_ai_extract_entry(dbname, contract_id):
+        """后台线程入口：独立 cursor + SUPERUSER 环境
+
+        ⚠️ 并发写竞态防护：识别期间用户可能在表单编辑同一条记录，
+        结果写库可能撞 psycopg2 SerializationFailure（并发更新冲突）。
+        整个提取+写库按"事务"为单位重试最多 3 次（新 cursor 新事务）。
+        """
+        try:
+            import odoo
+            import time as _time
+            registry = odoo.registry(dbname)
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    with registry.cursor() as cr:
+                        env = odoo.api.Environment(cr, odoo.SUPERUSER_ID, {})
+                        contract = env["contract.contract"].browse(contract_id)
+                        # 防御竞态：等待记录可见（正常情况下 spawn 前已 commit，立即可见）
+                        for _ in range(20):
+                            if contract.exists():
+                                break
+                            _time.sleep(0.5)
+                        if not contract.exists():
+                            _logger.error(
+                                "后台 AI 提取放弃 | contract_id=%s 记录不可见（疑似未提交）", contract_id
+                            )
+                            return
+                        contract._run_ai_extraction()
+                    break  # with 块退出即提交成功 → 跳出重试循环
+                except Exception:
+                    _logger.warning(
+                        "后台 AI 提取第 %d/%d 次尝试事务失败 | contract_id=%s",
+                        attempt, max_attempts, contract_id, exc_info=True,
+                    )
+                    if attempt >= max_attempts:
+                        raise
+                    _time.sleep(2)
+        except Exception:
+            _logger.exception("后台 AI 提取线程异常（重试耗尽） | contract_id=%s", contract_id)
+            # 最终兜底：新事务尽力把状态置为 failed，避免永远卡在「识别中」
+            try:
+                with registry.cursor() as cr:
+                    env = odoo.api.Environment(cr, odoo.SUPERUSER_ID, {})
+                    env["contract.contract"].browse(contract_id).sudo().write({
+                        "ai_extract_status": "failed",
+                        "ai_extract_error": "后台识别线程异常（已重试 %d 次），请点击「AI 自动提取」重试"
+                                            % max_attempts,
+                    })
+            except Exception:
+                _logger.critical("兜底标记失败状态也失败 | contract_id=%s", contract_id)
+
+    def _run_ai_extraction(self):
+        """同步执行 AI 提取全流程（仅供后台线程调用；结果写库 + chatter 通知）"""
+        self.ensure_one()
+        ai_url = self._get_ai_service_url()
+        pdf_bytes = base64.b64decode(self.source_pdf)
+
+        try:
+            files = {"file": (self.source_pdf_filename or "contract.pdf", pdf_bytes)}
+            _logger.info("▶️ 后台 AI 提取开始 | 合同=%s | AI_URL=%s", self.name, ai_url)
+            resp = requests.post(
+                f"{ai_url}/api/contract/extract",
+                files=files,
+                timeout=self.AI_EXTRACT_TIMEOUT,
+            )
+            _logger.info("   AI 响应 HTTP %s | body前200字=%s", resp.status_code, resp.text[:200])
+            if resp.status_code != 200:
+                raise RuntimeError("AI 服务返回 HTTP %s: %s" % (resp.status_code, resp.text[:200]))
+            raw = resp.json()
+        except requests.exceptions.ConnectionError:
+            self._mark_extract_failed(
+                _("无法连接 AI 服务 (%s)，请确认 ai-service 容器已启动") % ai_url
+            )
+            return
+        except Exception as e:
+            self._mark_extract_failed(_("AI 调用失败: %s") % e)
+            return
+
+        # AI 服务返回统一包装 {"success": true, "data": {...}, "error": null}
+        if not raw.get("success"):
+            self._mark_extract_failed(
+                _("AI 提取失败: %s") % raw.get("error", {}).get("message", "未知错误")
+            )
+            return
+
+        result = raw.get("data", raw)
+        _logger.info("✅ 解包成功 | data keys=%s", list(result.keys()))
+        try:
+            with self.env.cr.savepoint():
+                self._apply_ai_result(result)
+            self.sudo().write({"ai_extract_status": "success", "ai_extract_error": False})
+        except SerializationFailure:
+            # 并发更新冲突（识别期间用户编辑同一条记录）→ 抛给外层 _bg_ai_extract_entry
+            # 换新事务整体重试，不能在这里标记 failed（本次事务已污染）
+            _logger.warning("⚠️ 提取结果写库撞并发更新冲突，交由外层重试 | 合同=%s", self.name)
+            raise
+        except Exception as e:
+            # 编号唯一约束兜底：应用层查重存在 TOCTOU 竞态（两个后台线程并发
+            # 提取同一文件时，互相看不见对方未提交的编号），漏判后撞
+            # contract_contract_code_uniq。此时不能让整个提取成果作废——
+            # 降级重试：跳过编号写入，其余字段/条款/元素照常回填。
+            if "contract_contract_code_uniq" in str(e):
+                _logger.warning(
+                    "⚠️ 合同编号撞唯一约束（并发查重竞态），降级保留系统编号 | 合同=%s | %s",
+                    self.name, e,
+                )
+                with self.env.cr.savepoint():
+                    self._apply_ai_result(result, skip_code=True)
+                self.sudo().write({"ai_extract_status": "success", "ai_extract_error": False})
+                extracted_code = str(
+                    (result.get("extraction") or {}).get("contract_code") or ""
+                ).strip()
+                dup = self.sudo().search([("code", "=", extracted_code)], limit=1) if extracted_code else self.browse()
+                self.message_post(
+                    body=_("⚠️ AI 提取的合同编号 <b>%s</b> 与现有合同《%s》重复（疑似重复上传），"
+                           "本次已保留系统编号，其余提取结果已正常回填，请人工核实。")
+                       % (extracted_code or "-", dup.name or "未知"),
+                    subtype_id=self.env.ref("mail.mt_comment").id,
+                )
+                return
+            _logger.exception("AI 结果写入失败 | 合同=%s", self.name)
+            self.invalidate_recordset()
+            self._mark_extract_failed(_("提取结果写入失败: %s") % e)
+
+    def _mark_extract_failed(self, error_msg):
+        """标记识别失败 + chatter 提示（供后台线程调用）
+
+        ⚠️ 本方法绝不能抛异常：调用点已在异常处理中，若标记失败再炸
+        会导致状态永远卡在「识别中」。
+        """
+        _logger.warning("❌ 后台 AI 提取失败 | 合同=%s | %s", self.name, error_msg)
+        try:
+            self.invalidate_recordset()
+            self.sudo().write({"ai_extract_status": "failed", "ai_extract_error": error_msg})
+            self.message_post(
+                body=_("⚠️ <b>AI 识别失败</b>：%s<br/>可点击「🤖 AI 自动提取」按钮重试") % error_msg,
+                subtype_id=self.env.ref("mail.mt_comment").id,
+            )
+        except Exception:
+            _logger.exception("标记识别失败状态时出错 | 合同=%s（状态将由外层重试兜底）", self.name)
+            raise
+
+    def _get_ai_service_url(self):
+        """从 Odoo 系统参数读取 AI 服务地址"""
+        return self.env["ir.config_parameter"].sudo().get_param(
+            "contract_ai.ai_service_url",
+            "http://ai-service:8000",
+        )
+
+    @staticmethod
+    def _strip_nul(value):
+        """递归清洗数据中的 NUL(0x00) 字符
+
+        PostgreSQL 的 TEXT 与 JSONB 类型均不允许字符串含 NUL 字节。
+        AI 返回的 JSON 树（extraction/classify/clauses/elements 等）在
+        入库前统一过一遍，dict/list/str 递归处理，其余类型原样返回。
+        """
+        if isinstance(value, str):
+            return value.replace("\x00", "")
+        if isinstance(value, dict):
+            return {k: Contract._strip_nul(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [Contract._strip_nul(v) for v in value]
+        return value
+
+    def _apply_ai_result(self, result: dict, skip_code: bool = False):
+        """将 AI 服务返回的 JSON 映射到模型字段
+
+        AI 返回字段（已拍平，data.extraction 下）:
+          contract_name, contract_code, partner_a, partner_b,
+          amount, amount_uppercase, currency,
+          sign_date, effective_date, expire_date,    ← AI 用下划线命名
+          contract_type, payment_terms, breach_clause, dispute_resolution, confidence
+
+        Odoo 模型字段:
+          name, code, type, partner_a(M2O), partner_b(M2O),
+          amount, amount_uppercase, currency_id(M2O),
+          date_signed, date_start, date_end,          ← Odoo 风格
+          payment_terms, breach_clause, dispute_resolution
+
+        Args:
+            skip_code: 跳过合同编号写入（编号撞唯一约束降级重试时使用，
+                       保留系统编号，其余字段照常回填）
+        """
+        # ── 0. NUL(0x00) 防御清洗：PostgreSQL 的 TEXT/JSONB 均拒绝含 NUL
+        #    字节的字符串。PDF 文本层可能混入 \x00（pdfplumber/pypdf 解析
+        #    部分嵌入字体异常的 PDF 时），经 LLM 抄写原文可扩散到任意字段，
+        #    写库前递归清洗整棵返回树，避免 "A string literal cannot
+        #    contain NUL" 导致整个提取结果作废 ──
+        result = self._strip_nul(result)
+
+        extraction = result.get("extraction", {})
+        classify = result.get("classify", {})
+
+        _logger.info(
+            "📋 _apply_ai_result 收到 | extraction keys=%s | classify=%s",
+            list(extraction.keys()), classify,
+        )
+
+        # ── 中文合同类型 → Odoo Selection key ──
+        ctype_map = {
+            "采购合同": "purchase", "销售合同": "sale",
+            "服务合同": "service", "租赁合同": "lease",
+            "劳动合同": "labor", "合作协议": "partnership",
+            "咨询合同": "consulting", "其他": "other",
+        }
+
+        # ── 1. 置信度 + 原始 JSON + 质量门禁分级 ──
+        # quality 块由 AI 服务 gatekeeper 生成：
+        #   needs_review / review_reasons / system_confidence / critical_missing ...
+        quality = result.get("quality") or {}
+        needs_review = bool(quality.get("needs_review"))
+        reasons = [str(r) for r in (quality.get("review_reasons") or [])]
+
+        vals = {
+            "ai_extracted_json": result,
+            "classify_confidence": classify.get("confidence", 0),
+            "extraction_confidence": extraction.get("confidence", 0),
+            "system_confidence": quality.get("system_confidence") or 0,
+            # 分级落库：有风险 → 待人工复核；无风险 → 无需复核。
+            # 已人工确认的记录走到这里说明用户点了「重置复核」后重新提取，
+            # 以本次 AI 判定为准重新分级。
+            "review_state": "pending" if needs_review else "none",
+            "review_reasons": "\n".join("· %s" % r for r in reasons) if reasons else False,
+        }
+        if not quality:
+            _logger.warning(
+                "AI 返回缺少 quality 块（旧版 AI 服务？），质量门禁未生效 | 合同=%s", self.name
+            )
+
+        # ── 2. 基本字段 ──
+        if extraction.get("contract_name"):
+            vals["name"] = extraction["contract_name"]
+        if not skip_code and extraction.get("contract_code"):
+            # 编号冲突保护：撞号时保留系统编号并提示，避免唯一约束炸掉整个提取结果
+            # （注：并发提取同一文件时此查重仍可能漏判，唯一约束兜底由
+            #   _run_ai_extraction 的降级重试处理）
+            code = str(extraction["contract_code"]).strip()
+            dup = self.sudo().search([("code", "=", code), ("id", "!=", self.id)], limit=1)
+            if dup:
+                self.message_post(
+                    body=_("⚠️ AI 提取的合同编号 <b>%s</b> 与现有合同《%s》重复，本次保留系统编号") % (code, dup.name),
+                    subtype_id=self.env.ref("mail.mt_comment").id,
+                )
+            else:
+                vals["code"] = code
+        if classify.get("contract_type"):
+            vals["type"] = ctype_map.get(classify["contract_type"], False)
+
+        # ── 3. 金额 ──
+        if extraction.get("amount") is not None:
+            vals["amount"] = extraction["amount"]
+        if extraction.get("amount_uppercase"):
+            vals["amount_uppercase"] = extraction["amount_uppercase"]
+
+        # ── 4. 币种（CNY/USD → res.currency 查找）──
+        currency_code = extraction.get("currency")
+        if currency_code:
+            currency = self.env["res.currency"].sudo().search(
+                [("name", "=", currency_code)], limit=1,
+            )
+            if currency:
+                vals["currency_id"] = currency.id
+
+        # ── 5. 日期 ⚠️ 字段名必须和 AI 返回一致 ──
+        #    AI 返回: sign_date / effective_date / expire_date
+        #    Odoo 字段: date_signed / date_start / date_end
+        #    仅在 AI 成功解析出日期时写入，避免重提取时清空已有人工数据
+        sign_d = self._parse_date(extraction.get("sign_date"))
+        if sign_d:
+            vals["date_signed"] = sign_d
+        start_d = self._parse_date(extraction.get("effective_date"))
+        if start_d:
+            vals["date_start"] = start_d
+        end_d = self._parse_date(extraction.get("expire_date"))
+        if end_d:
+            vals["date_end"] = end_d
+
+        # ── 6. 业务条款 ──
+        if extraction.get("payment_terms"):
+            vals["payment_terms"] = extraction["payment_terms"]
+        if extraction.get("breach_clause"):
+            vals["breach_clause"] = extraction["breach_clause"]
+
+        # ── 7. 争议解决（AI 返回长文本，用关键词 contains 匹配）──
+        dispute_raw = str(extraction.get("dispute_resolution") or "")
+        if dispute_raw:
+            if "仲裁" in dispute_raw:
+                vals["dispute_resolution"] = "arbitration"
+            elif "法院" in dispute_raw or "诉讼" in dispute_raw or "起诉" in dispute_raw:
+                vals["dispute_resolution"] = "litigation"
+            elif "协商" in dispute_raw or "调解" in dispute_raw:
+                vals["dispute_resolution"] = "negotiation"
+            else:
+                vals["dispute_resolution"] = "negotiation"
+
+        _logger.info("📝 准备写入 vals: %s", {k: str(v)[:80] for k, v in vals.items()})
+        self.write(vals)
+
+        # ── 8. 甲乙方 Many2one 关联（AI 返回公司名 → 在 contract.counterparty 查找/创建）──
+        self._link_counterparty("partner_a", extraction.get("partner_a"))
+        self._link_counterparty("partner_b", extraction.get("partner_b"))
+
+        # ── 12. 合同条款 + 合同元素自动生成（AI 服务规则分段返回）──
+        self._generate_clauses_from_ai(result.get("clauses") or [])
+        self._generate_elements_from_ai(result.get("elements") or [])
+
+        # ── 10. B5 业财一体化：付款条款 → 自动生成收付款计划 ──
+        self._generate_payment_plans(extraction)
+
+        # ── 11. 大写金额交叉校验提示 ──
+        cross_check = extraction.get("amount_cross_check")
+        if cross_check is not None and not cross_check.get("match"):
+            self.message_post(
+                body=_("⚠️ <b>金额交叉校验不一致</b>：大写金额换算 %s 元 ≠ 提取金额 %s 元，请人工复核（大写优先）")
+                     % (cross_check.get("uppercase_as_number"),
+                        cross_check.get("extracted_amount")),
+                subtype_id=self.env.ref("mail.mt_comment").id,
+            )
+
+        # ── 9. 发布沟通记录（含质量门禁结果）──
+        done_body = _("🤖 AI 自动提取完成 | 合同类型: %s | 分类置信度: %s")
+        if needs_review:
+            reason_lines = "".join(
+                "<br/>· %s" % r for r in reasons
+            ) or "<br/>· （未提供明细）"
+            self.message_post(
+                body=(done_body % (
+                    classify.get("contract_type", "-"),
+                    f"{classify.get('confidence', 0):.1%}",
+                ))
+                + _("<br/><br/>⚠️ <b>质量门禁：存在 %d 项待复核风险，"
+                    "请人工核对并点击「✅ 复核确认」后才能提交审批</b>%s")
+                % (len(reasons) or 1, reason_lines),
+                subtype_id=self.env.ref("mail.mt_comment").id,
+            )
+            # M22: 待复核 → 给创建者创建 Odoo 待办（标记必达，不依赖用户主动查看）
+            self._sync_review_activity(True, reasons)
+        else:
+            self.message_post(
+                body=done_body % (
+                    classify.get("contract_type", "-"),
+                    f"{classify.get('confidence', 0):.1%}",
+                ) + _("<br/>✅ 质量门禁通过，无需人工复核"),
+                subtype_id=self.env.ref("mail.mt_comment").id,
+            )
+            # M22: 门禁通过（如重提取后质量变好）→ 清理遗留待办
+            self._sync_review_activity(False)
+        _logger.info(
+            "✅ 合同 %s AI 提取完成 | name=%s | amount=%s | date_signed=%s",
+            self.name, vals.get("name"), vals.get("amount"), vals.get("date_signed"),
+        )
+
+    def _generate_payment_plans(self, extraction: dict):
+        """B5 业财一体化：根据 AI 解析的付款条款自动生成收付款计划
+
+        AI 侧 payment_schedule（extraction 内）元素:
+          name / milestone / ratio(0-1) / amount / days_after_sign / description
+
+        规则:
+          - 只覆盖 source=ai_extracted 的旧计划，人工录入的计划不受影响
+          - 金额 = 固定金额 or 合同总额 × 比例
+          - 计划日期 = 签订日 + days_after_sign（缺失则按每期 +30 天粗估，需人工确认）
+        """
+        schedule = extraction.get("payment_schedule") or []
+        if not schedule:
+            return
+
+        PaymentPlan = self.env["contract.payment.plan"]
+
+        # 重新提取时覆盖 AI 生成的旧计划（人工录入 manual 保留）
+        old_ai_plans = self.payment_plan_ids.filtered(
+            lambda p: p.source == "ai_extracted"
+        )
+        if old_ai_plans:
+            old_ai_plans.unlink()
+
+        total = self.amount or 0.0
+        base_date = self.date_signed or fields.Date.context_today(self)
+        created = self.env["contract.payment.plan"]
+        for idx, node in enumerate(schedule, start=1):
+            planned_amount = node.get("amount")
+            if not planned_amount and node.get("ratio") is not None:
+                planned_amount = round(total * float(node["ratio"]), 2)
+            if not planned_amount:
+                continue
+
+            days = node.get("days_after_sign")
+            if not days:
+                days = 30 * (idx - 1)  # 粗估：每期顺延 30 天
+            planned_date = base_date + timedelta(days=int(days))
+
+            created |= PaymentPlan.create({
+                "contract_id": self.id,
+                "name": node.get("name") or ("第 %d 期" % idx),
+                "milestone": node.get("milestone") or "other",
+                "planned_amount": planned_amount,
+                "planned_date": planned_date,
+                "sort_order": idx,
+                "description": node.get("description") or "",
+                "source": "ai_extracted",
+            })
+
+        if created:
+            # 金额平衡校验：计划总额 vs 合同总额
+            diff = round(sum(created.mapped("planned_amount")) - total, 2)
+            warn = ""
+            if total and abs(diff) > 0.01:
+                warn = _("<br/>⚠️ 计划总额与合同金额相差 %s 元，请核对") % diff
+            self.message_post(
+                body=_("💰 <b>业财联动</b>：根据付款条款自动生成 %d 期收付款计划%s")
+                     % (len(created), warn),
+                subtype_id=self.env.ref("mail.mt_comment").id,
+            )
+            _logger.info("💰 合同 %s 自动生成 %d 期收付款计划 | 差异 %.2f 元",
+                         self.name, len(created), diff)
+
+    def _generate_clauses_from_ai(self, clauses: list):
+        """AI 提取结果 → contract.clause 记录
+
+        规则:
+          - 只覆盖 source=ai_extracted 的旧条款，人工录入/模板条款不受影响
+          - 空正文条款跳过；sort_order 用 AI 分段顺序（1..N）
+        """
+        if not clauses:
+            return
+        old_ai_clauses = self.clause_ids.filtered(lambda c: c.source == "ai_extracted")
+        if old_ai_clauses:
+            old_ai_clauses.unlink()
+
+        Clause = self.env["contract.clause"].sudo()
+        created = Clause.browse()
+        for idx, c in enumerate(clauses, start=1):
+            content = str(c.get("content") or "").strip()
+            if not content:
+                continue
+            created |= Clause.create({
+                "contract_id": self.id,
+                "name": (str(c.get("name") or "第 %d 条" % idx))[:100],
+                "clause_type": c.get("clause_type") or "other",
+                "content": content,
+                "sort_order": int(c.get("sort_order") or idx),
+                "source": "ai_extracted",
+            })
+
+        if created:
+            self.message_post(
+                body=_("📜 <b>自动生成合同条款</b>：共 %d 条") % len(created),
+                subtype_id=self.env.ref("mail.mt_comment").id,
+            )
+            _logger.info("📜 合同 %s 自动生成 %d 条条款", self.name, len(created))
+
+    def _generate_elements_from_ai(self, elements: list):
+        """AI 提取结果 → contract.element 记录
+
+        规则:
+          - 只覆盖 source=ai_extracted 的旧元素，人工录入的不受影响
+          - clause_index（1-based，对应 AI clauses 列表顺序）→ 关联到新条款
+          - value_text 恒写字符串化值；金额/日期另写强类型值字段
+        """
+        if not elements:
+            return
+        old_ai_elements = self.element_ids.filtered(lambda e: e.source == "ai_extracted")
+        if old_ai_elements:
+            old_ai_elements.unlink()
+
+        # 新生成的 AI 条款（sort_order 1..N 与 clause_index 对齐）
+        ai_clauses = self.clause_ids.filtered(
+            lambda c: c.source == "ai_extracted"
+        ).sorted("sort_order")
+
+        Element = self.env["contract.element"].sudo()
+        created = Element.browse()
+        for el in elements:
+            key = el.get("element_key")
+            if not key:
+                continue
+            vals = {
+                "contract_id": self.id,
+                "name": el.get("name") or key,
+                "element_key": key,
+                "group": el.get("group") or "other",
+                "element_type": el.get("element_type") or "text",
+                "value_text": el.get("value_text"),
+                "value_number": el.get("value_number"),
+                "confidence": el.get("confidence") or 0.0,
+                "source_text": el.get("source_text"),
+                "source": "ai_extracted",
+            }
+            if el.get("value_date"):
+                vals["value_date"] = self._parse_date(el["value_date"])
+            # 数字类型但解析失败 → 退化为文本
+            if vals["element_type"] == "number" and vals.get("value_number") is None:
+                vals["element_type"] = "text"
+            # 关联所属条款
+            ci = el.get("clause_index")
+            if ci and 1 <= int(ci) <= len(ai_clauses):
+                vals["clause_id"] = ai_clauses[int(ci) - 1].id
+            created |= Element.create(vals)
+
+        if created:
+            self.message_post(
+                body=_("🧩 <b>自动生成合同元素</b>：共 %d 个") % len(created),
+                subtype_id=self.env.ref("mail.mt_comment").id,
+            )
+            _logger.info("🧩 合同 %s 自动生成 %d 个元素", self.name, len(created))
+
+    def _link_counterparty(self, field_name: str, company_name):
+        """
+        根据 AI 返回的公司名，在 contract.counterparty 中查找或创建记录，
+        然后绑定到当前合同的 Many2one 字段上。
+
+        Args:
+            field_name: "partner_a" 或 "partner_b"
+            company_name: AI 提取的公司全称（如 "北京智慧城市建设发展有限公司"）
+        """
+        if not company_name:
+            return
+        company_name = str(company_name).strip()
+        if not company_name:
+            return
+
+        Counterparty = self.env["contract.counterparty"].sudo()
+
+        # 精确匹配已有记录
+        cp = Counterparty.search([("name", "=", company_name)], limit=1)
+
+        # 没找到 → 创建新的
+        if not cp:
+            cp = Counterparty.create({
+                "name": company_name,
+                "party_type": "company",
+            })
+            _logger.info("🆕 AI 提取新建 counterparty: name=%s id=%s", company_name, cp.id)
+
+        # 绑定 Many2one
+        self.write({field_name: cp.id})
+        _logger.info("🔗 %s → %s (id=%s)", field_name, company_name, cp.id)
+
+    @staticmethod
+    def _parse_date(date_str):
+        """兼容 YYYY-MM-DD / YYYY/MM/DD / 中文日期的日期解析"""
+        if not date_str:
+            return False
+        if isinstance(date_str, date):
+            return date_str
+        # 中文日期 → ISO
+        date_str = str(date_str).strip()
+        for sep in ("-", "/", "年"):
+            date_str = date_str.replace(sep, "-")
+        date_str = date_str.replace("月", "-").replace("日", "")
+        try:
+            return date.fromisoformat(date_str)
+        except (ValueError, TypeError):
+            return False
+
+    # ════════════════════════════════════════════════
+    # M16 · 业财一体化：收付款计划自动生成 + 汇总
+    # ════════════════════════════════════════════════
+
+    @api.depends("payment_plan_ids", "payment_plan_ids.planned_amount",
+                 "payment_plan_ids.actual_amount", "payment_plan_ids.state",
+                 "payment_plan_ids.is_overdue")
+    def _compute_payment_summary(self):
+        for rec in self:
+            plans = rec.payment_plan_ids
+            rec.payment_plan_count = len(plans)
+            rec.planned_amount_total = sum(plans.mapped("planned_amount"))
+            rec.paid_amount_total = sum(
+                p.actual_amount or 0 for p in plans if p.state == "paid"
+            )
+            rec.remaining_amount_total = rec.planned_amount_total - rec.paid_amount_total
+            rec.overdue_count = sum(1 for p in plans if p.is_overdue)
+
+    def generate_payment_plan(self):
+        """
+        解析 payment_terms 文本，自动生成收付款计划。
+
+        解析策略（规则式，覆盖 80% 常见格式）：
+          1. 按句切分（/[；;\n]）
+          2. 每句提取：百分比 + 节点类型关键字 + 时间偏移
+          3. 金额 = 合同总额 × 百分比；日期 = 签订日 + 偏移天数
+          4. 无签订日时用今天；无明确节点时标记为 other
+          5. 无明确时间时默认按节点序号等间隔排布
+
+        典型格式示例：
+          "合同签订后 5 个工作日内支付合同总金额的 30% 作为预付款"
+          "设备到货并经验收合格后 10 个工作日内支付 60%"
+          "剩余 10% 作为质保金，于质保期届满后 30 日内无息支付"
+          "按季度结算，每季度末乙方提交服务报告"（ fallback 为等额分期）
+        """
+        self.ensure_one()
+        if not self.amount or self.amount <= 0:
+            raise UserError(_("合同金额为 0，无法生成收付款计划"))
+
+        text = (self.payment_terms or "").strip()
+        if not text:
+            raise UserError(_("付款方式条款为空，请先填写"))
+
+        # ── 清理旧计划（草稿或已取消的可以覆盖；已确认/已完成的要先处理）──
+        if any(p.state in ("confirmed", "partial", "paid") for p in self.payment_plan_ids):
+            raise UserError(_(
+                "已存在确认/完成状态的收付款计划，请先处理或手动删除旧记录"
+            ))
+        self.payment_plan_ids.unlink()
+
+        milestones = self._parse_payment_terms(text)
+
+        if not milestones:
+            # 兜底：生成一条 100% 尾款计划
+            milestones = [{
+                "name": "合同尾款",
+                "milestone": "final",
+                "percent": 1.0,
+                "offset_days": 30,
+                "raw_desc": text[:80],
+            }]
+
+        sign_date = self.date_signed or fields.Date.today()
+
+        plan_vals = []
+        for i, m in enumerate(milestones, 1):
+            planned_amount = round(self.amount * m["percent"], 2)
+            planned_date = sign_date + timedelta(days=m["offset_days"])
+            plan_vals.append((0, 0, {
+                "name": m["name"],
+                "sort_order": i,
+                "milestone": m["milestone"],
+                "planned_amount": planned_amount,
+                "planned_date": planned_date,
+                "description": m.get("raw_desc", ""),
+                "state": "draft",
+            }))
+
+        self.write({"payment_plan_ids": plan_vals})
+
+        self.message_post(
+            body=_("📋 自动生成收付款计划 | %d 个节点 | 合计 %.2f %s")
+                 % (len(milestones), self.amount, self.currency_id.symbol),
+            subtype_id=self.env.ref("mail.mt_comment").id,
+        )
+        _logger.info("合同 %s 自动生成 %d 个收付款节点", self.name, len(milestones))
+
+        # 返回 act_window：前端重新拉取 record 数据，自动刷新 One2many 列表
+        return {
+            "type": "ir.actions.act_window",
+            "res_model": "contract.contract",
+            "res_id": self.id,
+            "view_mode": "form",
+            "target": "current",
+        }
+
+    def _parse_payment_terms(self, text: str) -> list[dict]:
+        """
+        中文付款条款解析器。返回 list of dict:
+          [{name, milestone, percent, offset_days, raw_desc}, ...]
+        """
+        # 按分号/换行切句
+        sentences = [s.strip() for s in re.split(r"[；;\n]", text) if s.strip()]
+
+        # ── 节点类型关键词 → milestone code ──
+        milestone_map = [
+            (r"预付", "prepayment", "预付款"),
+            (r"[到送]货?.*(验|收|交)", "on_delivery", "到货款"),
+            (r"[到送]货", "on_delivery", "到货款"),
+            (r"(完工|竣工|完成).*(验|收|交)", "on_completion", "验收款"),
+            (r"(验收|交(付|付?款)).*(合格|通过|完成)", "on_completion", "验收款"),
+            (r"尾款|余款|质保金|质保期届满", "final", "尾款"),
+            (r"分期|每月|按月|季度|按季", "installment", "分期款"),
+        ]
+
+        milestones = []
+        total_percent = 0.0
+
+        for sent in sentences:
+            # 提取百分比：30% / 百分之30 / 30 ％
+            pct_match = re.search(r"(\d+(?:\.\d+)?)\s*%|百分之\s*(\d+(?:\.\d+)?)", sent)
+            if not pct_match:
+                continue
+            percent = float(pct_match.group(1) or pct_match.group(2)) / 100.0
+
+            # 提取固定金额（万元/元）
+            fixed_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:万元|万元?|元)", sent)
+            # 如果只有固定金额没百分比，跳过（按合同比例生成更好）
+
+            # 确定节点类型
+            milestone_code = "other"
+            milestone_label = "其他"
+            for pattern, code, label in milestone_map:
+                if re.search(pattern, sent):
+                    milestone_code = code
+                    milestone_label = label
+                    break
+
+            # 提取时间偏移
+            offset_days = self._parse_time_offset(sent, milestone_code)
+
+            # 序号式命名
+            seq = len(milestones) + 1
+            name = f"第 {seq} 期 · {milestone_label}"
+
+            milestones.append({
+                "name": name,
+                "milestone": milestone_code,
+                "percent": percent,
+                "offset_days": offset_days,
+                "raw_desc": sent,
+            })
+            total_percent += percent
+
+        # ── 百分比校验：总和偏离 100% 时标记 warning 但不阻止 ──
+        if milestones:
+            if abs(total_percent - 1.0) > 0.02:
+                _logger.warning(
+                    "合同 %s 付款条款解析：百分比合计 %.0f%%，偏离 100%% 较大，请人工核对",
+                    self.name, total_percent * 100,
+                )
+
+        return milestones
+
+    @staticmethod
+    def _parse_time_offset(sent: str, milestone: str) -> int:
+        """
+        从一句中文里解析付款时间偏移天数（相对于签订日）。
+        典型模式：
+          "签订后 5 个工作日内" → +5
+          "签订后" → +0
+          "到货后 10 日内" → +30（到货日不确定时给合理估算）
+          "月底/月初" → 不明确，给默认值
+          无法解析 → fallback 按 milestone 给合理默认
+        """
+        # 显式天数：N 个工作日 / N 日内 / N 天内 / N 个月内
+        day_match = re.search(
+            r"(\d+)\s*个?\s*(?:工作日|日历日|日内|天内|日)"
+            r"|(\d+)\s*个月?(?:内后)?",
+            sent,
+        )
+        if day_match:
+            if day_match.group(1):
+                return int(day_match.group(1))
+            elif day_match.group(2):
+                return int(day_match.group(2)) * 30
+
+        # 明确以签订日为基准
+        if re.search(r"签订后|签约后|合同(签订|生效)后", sent):
+            return 0
+
+        # 明确以到货日为基准 → 估算 30 天（常见到货周期）
+        if milestone == "on_delivery":
+            return 30
+
+        # 明确以验收/完工日为基准 → 估算 60 天
+        if milestone == "on_completion":
+            return 60
+
+        # 尾款 → 默认 90 天
+        if milestone == "final":
+            return 90
+
+        # 分期款 → 默认按月
+        if milestone == "installment":
+            return 30 * (len(re.findall(r"[，,、]", sent)) + 1) or 30
+
+        # 都不明确 → 给一个安全默认
+        return 15
+
+    # ════════════════════════════════════════════════
+    # 状态流转按钮（严格校验 + mail.thread 全记录）
+    # ════════════════════════════════════════════════
+
+    # ── 状态标签映射（用于 chatter 日志） ──
+    _state_label = {
+        "draft": "草拟",
+        "approval": "审批中",
+        "seal": "已用印",
+        "archived": "已归档",
+        "void": "已作废",
+    }
+
+    def _log_state_change(self, old_state, new_state):
+        """辅助：统一的状态变更 chatter 日志"""
+        self.message_post(
+            body=_("状态变更：<b>%s</b> → <b>%s</b>") % (
+                self._state_label.get(old_state, old_state),
+                self._state_label.get(new_state, new_state),
+            ),
+            subtype_id=self.env.ref("mail.mt_comment").id,
+        )
+
+    # ════════════════════════════════════════════════
+    # P0-2 · 审批流（对应肇新 Activiti 审批设计，Odoo 17 用
+    #        ir.actions.server + contract.approval.log 实现）
+    # 流转：draft --提交--> approval --通过--> seal --归档--> archived
+    #                    └─驳回→ draft
+    # ════════════════════════════════════════════════
+
+    def _notify(self, title, message, msg_type="success"):
+        """顶部通知（display_notification 客户端动作）"""
+        return {
+            "type": "ir.actions.client",
+            "tag": "display_notification",
+            "params": {"title": title, "message": message, "type": msg_type},
+        }
+
+    def _log_approval(self, action: str, comment: str):
+        """落一条审批日志（contract.approval.log）"""
+        self.env["contract.approval.log"].create({
+            "contract_id": self.id,
+            "action": action,
+            "comment": comment,
+        })
+
+    def action_submit_approval(self):
+        """草拟 → 审批中（提交审批）
+
+        ⚠️ 审批卡点：AI 质量门禁判定「待人工复核」的合同必须先复核确认，
+        防止错误信息（证据不符/关键缺失/置信度过低）流入审批与用印环节。
+        """
+        for rec in self:
+            if rec.state != "draft":
+                return rec._notify("状态错误", "只有草拟状态才能提交审批", "warning")
+            if rec.review_state == "pending":
+                raise UserError(_(
+                    "AI 质量门禁存在待复核风险，请先核对并点击「✅ 复核确认」后再提交审批。\n\n"
+                    "风险明细：\n%s"
+                ) % (rec.review_reasons or "（未提供明细，请查看 AI 提取结果）"))
+            old = rec.state
+            rec.state = "approval"
+            rec._log_state_change(old, "approval")
+            rec._log_approval("submit", "提交审批")
+        return self._notify("已提交", "合同已提交审批")
+
+    # ════════════════════════════════════════════════
+    # AI 质量门禁：复核确认 / 重置复核
+    # ════════════════════════════════════════════════
+
+    def _sync_review_activity(self, needs_review: bool, reasons: list = None):
+        """M22: 把"待复核"同步为 Odoo 待办（mail.activity）——标记必达。
+
+        AI 转人工只是 chatter 告警时用户可能看不到；创建待办后：
+        - 复核人（合同创建者）的待办菜单直接出现，避免风险被遗忘
+        - 重提取/确认/重置时自动清理，不留僵尸待办
+        """
+        self.ensure_one()
+        old = self.activity_ids.filtered(
+            lambda a: a.summary == self._AI_REVIEW_ACTIVITY_SUMMARY
+        )
+        if not needs_review:
+            old.unlink()
+            return
+        old.unlink()  # 重提取场景：先清旧待办再建新的，避免重复堆积
+        reason_lines = "".join("<br/>· %s" % r for r in (reasons or [])) or "<br/>· （详见 chatter 记录）"
+        self.activity_schedule(
+            "mail.mail_activity_data_todo",
+            summary=self._AI_REVIEW_ACTIVITY_SUMMARY,
+            note=_("AI 质量门禁标记 %d 项风险，请对照 PDF 原件核对后点击「✅ 复核确认」：%s")
+                  % (len(reasons or []) or 1, reason_lines),
+            user_id=self.create_uid.id or self.env.user.id,
+            date_deadline=fields.Date.context_today(self) + timedelta(days=1),
+        )
+
+    def action_confirm_review(self):
+        """人工确认 AI 提取结果（待人工复核 → 已人工确认）"""
+        for rec in self:
+            if rec.review_state != "pending":
+                continue
+            rec.write({"review_state": "confirmed", "review_reasons": False})
+            rec._sync_review_activity(False)  # M22: 复核完成 → 清理待办
+            rec._log_approval("review_confirm", "人工确认 AI 提取结果")
+            rec.message_post(
+                body=_("✅ <b>复核确认</b>：人工已核对 AI 提取结果，风险项已处理，可提交审批"),
+                subtype_id=self.env.ref("mail.mt_comment").id,
+            )
+        return self._notify("复核确认", "AI 提取结果已人工确认")
+
+    def action_reset_review(self):
+        """重置复核状态：允许重新 AI 提取覆盖已确认数据（明确的人工操作）"""
+        for rec in self:
+            if rec.review_state == "none":
+                continue
+            old_label = dict(self._fields["review_state"].selection).get(rec.review_state, rec.review_state)
+            rec.write({"review_state": "none", "review_reasons": False})
+            rec._sync_review_activity(False)  # M22: 重置后待重新提取 → 清理旧待办
+            rec._log_approval("review_reset", "重置复核状态（原：%s）" % old_label)
+            rec.message_post(
+                body=_("♻️ <b>复核状态已重置</b>：可重新执行「🤖 AI 自动提取」，"
+                       "新结果将以 AI 判定重新分级"),
+                subtype_id=self.env.ref("mail.mt_comment").id,
+            )
+        return self._notify("已重置", "复核状态已重置，可重新 AI 提取")
+
+    # ════════════════════════════════════════════════
+    # M24: 条款重新拆分（按章节把「全文」等粗粒度条款拆成独立条款行）
+    # ════════════════════════════════════════════════
+
+    def action_resplit_clauses(self):
+        """按章节重新拆分 AI 条款
+
+        把当前 source=ai_extracted 条款的正文合并后调 AI 服务 /api/contract/segment
+        重新分段（规则式，零 LLM 成本），重建条款记录：
+          - 只覆盖 source=ai_extracted 条款，人工录入/模板条款不动
+          - 识别「第X条」「一、二、三、」章节头，文头信息归「合同基本信息」(other)
+          - 文本规范化：清理多余空格/统一标点（不碰编号、甲乙方、金额等业务数据）
+        """
+        for rec in self:
+            ai_clauses = rec.clause_ids.filtered(lambda c: c.source == "ai_extracted")
+            if not ai_clauses:
+                return rec._notify("无可拆分条款", "没有 AI 提取的条款可重新拆分", "warning")
+            full_text = "\n".join(
+                c.content for c in ai_clauses.sorted("sort_order") if c.content
+            ).strip()
+            if not full_text:
+                return rec._notify("正文为空", "AI 条款正文为空，无法拆分", "warning")
+
+            ai_url = rec._get_ai_service_url().rstrip("/")
+            try:
+                resp = requests.post(
+                    f"{ai_url}/api/contract/segment",
+                    json={"text": full_text},
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+            except Exception as e:
+                _logger.error("条款重新拆分调用 AI 服务失败 | contract=%s | %s", rec.name, e)
+                raise UserError(_("条款拆分服务不可用（%s），请稍后重试或检查 AI 服务状态") % ai_url)
+
+            data = payload.get("data") or {}
+            clauses = data.get("clauses") or []
+            if len(clauses) <= 1:
+                return rec._notify(
+                    "无需拆分",
+                    "未识别出多章节结构（可能已拆分或不规则），保持原状",
+                    "warning",
+                )
+            rec._generate_clauses_from_ai(clauses)
+            rec.message_post(
+                body=_("🧩 <b>条款重新拆分</b>：%d 条 → %d 条独立条款（按章节规则分段）")
+                     % (len(ai_clauses), len(clauses)),
+                subtype_id=self.env.ref("mail.mt_comment").id,
+            )
+        return self._notify("拆分完成", "条款已按章节重新拆分")
+
+    def action_approve(self):
+        """审批中 → 已用印（审批通过）"""
+        for rec in self:
+            if rec.state != "approval":
+                return rec._notify("状态错误", "非审批中状态", "warning")
+            old = rec.state
+            rec.state = "seal"
+            rec._log_state_change(old, "seal")
+            rec._log_approval("approve", "审批通过")
+            rec.message_post(
+                body=_("✅ 审批通过，进入用印阶段"),
+                subtype_id=self.env.ref("mail.mt_comment").id,
+            )
+        return self._notify("已通过", "合同审批已通过")
+
+    def action_reject(self):
+        """审批中 → 草拟（审批驳回）"""
+        for rec in self:
+            if rec.state != "approval":
+                return rec._notify("状态错误", "非审批中状态", "warning")
+            old = rec.state
+            rec.state = "draft"
+            rec._log_state_change(old, "draft")
+            rec._log_approval("reject", "审批驳回")
+            rec.message_post(
+                body=_("❌ 审批驳回，退回修改"),
+                subtype_id=self.env.ref("mail.mt_comment").id,
+            )
+        return self._notify("已驳回", "合同已驳回", "danger")
+
+    def action_archive(self):
+        """已用印 → 已归档（严格：只有 seal 才能归档）"""
+        for rec in self:
+            if rec.state != "seal":
+                raise UserError(_("只有已用印状态才能归档"))
+            old = rec.state
+            rec.state = "archived"
+            rec._log_state_change(old, "archived")
+
+    def action_void(self):
+        """任意 → 已作废（不可逆）"""
+        for rec in self:
+            if rec.state == "void":
+                continue
+            old = rec.state
+            rec.state = "void"
+            rec._log_state_change(old, "void")
+
+    def action_reset_draft(self):
+        """审批中/已用印 → 草拟（归档/作废不可逆；审批中重置视为撤回）"""
+        for rec in self:
+            if rec.state in ("archived", "void"):
+                raise UserError(_("%s 状态不可重置为草拟") % self._state_label.get(rec.state, rec.state))
+            old = rec.state
+            rec.state = "draft"
+            rec._log_state_change(old, "draft")
+            if old == "approval":
+                rec._log_approval("cancel", "撤回审批，退回草拟")
+
+    # ════════════════════════════════════════════════
+    # P0-2 · Cron 定时任务（对照肇新 ContractJobService 定时扫描）
+    # ════════════════════════════════════════════════
+
+    @api.model
+    def _cron_overdue_reminder(self):
+        """收付款逾期提醒：扫描已逾期未完成的收付款计划，按合同聚合后在 chatter 提醒"""
+        today = fields.Date.today()
+        plans = self.env["contract.payment.plan"].search([
+            ("planned_date", "<", today),
+            ("state", "in", ("draft", "confirmed", "partial")),
+            ("actual_date", "=", False),
+        ])
+        if not plans:
+            return
+        by_contract = {}
+        for plan in plans:
+            by_contract.setdefault(plan.contract_id, plan)
+        for contract in by_contract:
+            contract_plans = plans.filtered(lambda p: p.contract_id == contract)
+            lines = "".join(
+                "· %s（计划 %s，%.2f 元）<br/>" % (
+                    p.name, p.planned_date, p.planned_amount,
+                ) for p in contract_plans.sorted("planned_date")
+            )
+            contract.message_post(
+                body=_("⚠️ <b>收付款逾期提醒</b>：有 %d 个节点已逾期未完成<br/>%s")
+                     % (len(contract_plans), lines),
+                subtype_id=self.env.ref("mail.mt_comment").id,
+            )
+        _logger.info("🔔 逾期提醒 cron：扫描 %d 个计划 / %d 份合同",
+                     len(plans), len(by_contract))
+
+    @api.model
+    def _cron_expire_contracts(self):
+        """合同到期自动归档：已用印且失效日期已过的合同自动流转到已归档"""
+        today = fields.Date.today()
+        expired = self.search([
+            ("date_end", "<", today),
+            ("state", "=", "seal"),
+        ])
+        if not expired:
+            return
+        for rec in expired:
+            rec.state = "archived"
+            rec.message_post(
+                body=_("📦 合同已于 %s 到期，自动归档") % rec.date_end,
+                subtype_id=self.env.ref("mail.mt_comment").id,
+            )
+        _logger.info("📦 到期归档 cron：自动归档 %d 份合同", len(expired))

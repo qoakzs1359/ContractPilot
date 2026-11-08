@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data>
+
+        <!-- contract.template — 列表视图（用 <tree> 根元素！） -->
+        <record id="view_contract_template_list" model="ir.ui.view">
+            <field name="name">contract.template.list</field>
+            <field name="model">contract.template</field>
+            <field name="arch" type="xml">
+                <tree string="合同模板">
+                    <field name="name"/>
+                    <field name="type"/>
+                    <field name="version"/>
+                    <field name="is_active"/>
+                    <field name="usage_count"/>
+                </tree>
+            </field>
+        </record>
+
+        <!-- contract.template — 表单视图 -->
+        <record id="view_contract_template_form" model="ir.ui.view">
+            <field name="name">contract.template.form</field>
+            <field name="model">contract.template</field>
+            <field name="arch" type="xml">
+                <form string="合同模板">
+                    <sheet>
+                        <group>
+                            <group string="基本信息">
+                                <field name="name"/>
+                                <field name="type"/>
+                                <field name="version"/>
+                                <field name="is_active"/>
+                            </group>
+                            <group string="统计">
+                                <field name="usage_count"/>
+                            </group>
+                        </group>
+                        <notebook>
+                            <page string="模板条款" name="clauses">
+                                <!-- M23：顶部全文排版预览 + 列表单行摘要，点击行进对话框编辑 -->
+                                <field name="clauses_preview_html" nolabel="1" readonly="1"
+                                       class="o_clause_preview_panel"
+                                       invisible="not clause_ids"/>
+                                <field name="clause_ids" nolabel="1">
+                                    <tree>
+                                        <field name="sort_order"/>
+                                        <field name="name"/>
+                                        <field name="clause_type"/>
+                                        <field name="is_required"/>
+                                        <field name="content_html" widget="html" string="条款正文"
+                                               class="o_clause_content_html"/>
+                                    </tree>
+                                </field>
+                            </page>
+                        </notebook>
+                    </sheet>
+                </form>
+            </field>
+        </record>
+
+        <!-- contract.clause — 条款编辑对话框（M23：列表行点击打开；
+             上部编辑正文，下部实时排版预览） -->
+        <record id="view_contract_clause_form" model="ir.ui.view">
+            <field name="name">contract.clause.form</field>
+            <field name="model">contract.clause</field>
+            <field name="arch" type="xml">
+                <form string="合同条款">
+                    <sheet>
+                        <group>
+                            <group string="基本信息">
+                                <field name="name"/>
+                                <field name="clause_type"/>
+                                <field name="sort_order"/>
+                            </group>
+                            <group string="属性">
+                                <field name="source" readonly="1"/>
+                                <field name="is_required"/>
+                                <field name="is_modified" readonly="1"/>
+                            </group>
+                        </group>
+                        <separator string="条款正文"/>
+                        <field name="content" nolabel="1" widget="textarea"
+                               placeholder="支持纯文本；「第X条 / 一、 / （一） / 1.」开头的行会自动识别为标题"/>
+                        <separator string="排版预览"/>
+                        <field name="content_html" nolabel="1" readonly="1"
+                               class="o_clause_preview_panel"/>
+                    </sheet>
+                </form>
+            </field>
+        </record>
+
+        <!-- contract.template — 搜索视图 -->
+        <record id="view_contract_template_search" model="ir.ui.view">
+            <field name="name">contract.template.search</field>
+            <field name="model">contract.template</field>
+            <field name="arch" type="xml">
+                <search string="合同模板">
+                    <field name="name"/>
+                    <field name="type"/>
+                    <separator/>
+                    <filter string="已启用" name="filter_active" domain="[('is_active','=',True)]"/>
+                    <filter string="采购" name="filter_purchase" domain="[('type','=','purchase')]"/>
+                    <filter string="销售" name="filter_sale" domain="[('type','=','sale')]"/>
+                    <group expand="0" string="分组">
+                        <filter string="类型" name="group_type" context="{'group_by':'type'}"/>
+                    </group>
+                </search>
+            </field>
+        </record>
+
+        <!-- 合同模板 Action 菜单入口 -->
+        <record id="action_contract_template" model="ir.actions.act_window">
+            <field name="name">合同模板</field>
+            <field name="res_model">contract.template</field>
+            <field name="view_mode">tree,form</field>
+        </record>
+
+    </data>
+</odoo>
